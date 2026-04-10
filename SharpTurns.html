@@ -355,9 +355,17 @@ async function osrm(pts){
     return{geo:rt.geometry.coordinates.map(function(c){return{lat:c[1],lon:c[0]};}),dist:rt.distance/1000,dur:rt.duration/60};
   }catch(e){throw new Error('OSRM failed: '+e.message+'. The public server may be busy — try again.');}
 }
-async function fetchRds(bb){
-  var s=bb[0],w=bb[1],n=bb[2],e=bb[3];
-  var q='[out:json][timeout:90];(way["highway"~"^(primary|secondary|tertiary|unclassified)$"]('+s+','+w+','+n+','+e+'););out geom qt;';
+// Sample n evenly-spaced points from a geometry array
+function sampleGeo(geo,n){
+  if(geo.length<=n)return geo;
+  var result=[],i;
+  for(i=0;i<n;i++){var idx=Math.round(i*(geo.length-1)/(n-1));result.push(geo[idx]);}
+  return result;
+}
+// Fetch roads within radiusM metres of a sampled baseline polyline (corridor query)
+async function fetchRdsCorridor(pts,radiusM){
+  var coords=pts.map(function(p){return p.lat+','+p.lon;}).join(',');
+  var q='[out:json][timeout:90];(way["highway"~"^(secondary|tertiary|unclassified)$"](around:'+radiusM+','+coords+'););out geom qt;';
   var eps=['https://overpass-api.de/api/interpreter','https://maps.mail.ru/osm/tools/overpass/api/interpreter','https://overpass.kumi.systems/api/interpreter'];
   var le,i;
   for(i=0;i<eps.length;i++){
@@ -387,7 +395,7 @@ function getRoadEndpoints(road, baseGeo){
   };
 }
 
-async function selectWPs(roads, baseGeo, org, dst, curv, maxDur){
+async function selectWPs(roads, baseGeo, org, dst, curv, maxDur, baseDur){
   var corridorKm = 8+(curv/100)*17;
   var minScore   = 150+(1-curv/100)*600;
 
@@ -413,26 +421,26 @@ async function selectWPs(roads, baseGeo, org, dst, curv, maxDur){
   candidates=candidates.slice(0,30);
   candidates.sort(function(a,b){return a.entryProg-b.entryProg;});
 
-  var accepted=[];
-  // Parallel OSRM testing: batch 3 candidates at a time instead of sequential
-  var batchSize=3;
-  for(var ci=0;ci<candidates.length;ci+=batchSize){
+  // ONE parallel batch: test every candidate solo (org → entry → exit → dst)
+  var soloPromises=candidates.map(function(c){
+    var pts=[org,{lat:c.entry.lat,lon:c.entry.lon},{lat:c.exit.lat,lon:c.exit.lon},dst];
+    return osrm(pts).then(function(r){return{candidate:c,addedTime:r.dur-baseDur};}).catch(function(){return null;});
+  });
+  var soloResults=await Promise.all(soloPromises);
+
+  // Keep candidates whose solo detour fits in budget, sort by forward progress
+  var viable=soloResults
+    .filter(function(r){return r&&r.addedTime>0&&(baseDur+r.addedTime)<=maxDur;})
+    .sort(function(a,b){return a.candidate.entryProg-b.candidate.entryProg;});
+
+  // Greedy forward sweep: accumulate detours while budget allows
+  var accepted=[],estimatedDur=baseDur,vi;
+  for(vi=0;vi<viable.length;vi++){
     if(accepted.length>=8) break;
-    var batch=candidates.slice(ci,Math.min(ci+batchSize,candidates.length));
-    var promises=batch.map(function(c){
-      var ordered=accepted.concat([c]).sort(function(a,b){return a.entryProg-b.entryProg;});
-      var pts=[org];
-      for(var wi=0;wi<ordered.length;wi++){
-        pts.push({lat:ordered[wi].entry.lat,lon:ordered[wi].entry.lon});
-        pts.push({lat:ordered[wi].exit.lat, lon:ordered[wi].exit.lon});
-      }
-      pts.push(dst);
-      return osrm(pts).then(function(result){return{candidate:c,result:result}}).catch(function(e){return null});
-    });
-    var results=await Promise.all(promises);
-    results.forEach(function(r){
-      if(r&&accepted.length<8&&r.result.dur<=maxDur) accepted.push(r.candidate);
-    });
+    if(estimatedDur+viable[vi].addedTime<=maxDur){
+      accepted.push(viable[vi].candidate);
+      estimatedDur+=viable[vi].addedTime;
+    }
   }
   return accepted.sort(function(a,b){return a.entryProg-b.entryProg;});
 }
@@ -583,14 +591,10 @@ async function planRoute(){
     var maxDur=base.dur*(1+detPct/100);
     setStep(2,'done');
 
-    // Step 3: Fetch roads
+    // Step 3: Fetch roads within 25km corridor of the baseline route
     setStep(3,'active');
-    var lats=stops.map(function(s){return s.lat;});
-    var lons=stops.map(function(s){return s.lon;});
-    var pad=0.25+(curv/100)*0.5;
-    var bb=[Math.min.apply(null,lats)-pad,Math.min.apply(null,lons)-pad,
-            Math.max.apply(null,lats)+pad,Math.max.apply(null,lons)+pad];
-    var osmd=await fetchRds(bb);
+    var corridorPts=sampleGeo(base.geo,15);
+    var osmd=await fetchRdsCorridor(corridorPts,25000);
     setStep(3,'done');
     if(!osmd.elements||!osmd.elements.length) throw new Error('No roads found in area.');
 
@@ -619,7 +623,7 @@ async function planRoute(){
     // Step 5: Select waypoints (Option C)
     setStep(5,'active');
     var org=stops[0],dst=stops[stops.length-1];
-    var wps=await selectWPs(roads,base.geo,org,dst,curv,maxDur);
+    var wps=await selectWPs(roads,base.geo,org,dst,curv,maxDur,base.dur);
 
     // Build final route through entry/exit pairs
     var finalPts=[org];
