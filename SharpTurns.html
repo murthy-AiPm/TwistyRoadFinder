@@ -395,7 +395,7 @@ function getRoadEndpoints(road, baseGeo){
   };
 }
 
-async function selectWPs(roads, baseGeo, org, dst, curv, maxDur, baseDur){
+async function selectWPs(roads, baseGeo, org, dst, curv, maxDur, baseDur, baseDist){
   var corridorKm = 8+(curv/100)*17;
   var minScore   = 150+(1-curv/100)*600;
 
@@ -421,25 +421,23 @@ async function selectWPs(roads, baseGeo, org, dst, curv, maxDur, baseDur){
   candidates=candidates.slice(0,30);
   candidates.sort(function(a,b){return a.entryProg-b.entryProg;});
 
-  // ONE parallel batch: test every candidate solo (org → entry → exit → dst)
-  var soloPromises=candidates.map(function(c){
-    var pts=[org,{lat:c.entry.lat,lon:c.entry.lon},{lat:c.exit.lat,lon:c.exit.lon},dst];
-    return osrm(pts).then(function(r){return{candidate:c,addedTime:r.dur-baseDur};}).catch(function(){return null;});
-  });
-  var soloResults=await Promise.all(soloPromises);
-
-  // Keep candidates whose solo detour fits in budget, sort by forward progress
-  var viable=soloResults
-    .filter(function(r){return r&&r.addedTime>0&&(baseDur+r.addedTime)<=maxDur;})
-    .sort(function(a,b){return a.candidate.entryProg-b.candidate.entryProg;});
+  // Estimate added time geometrically — zero OSRM calls needed
+  var baseSpeed=baseDist/baseDur; // km per minute
+  for(var ei=0;ei<candidates.length;ei++){
+    var c=candidates[ei];
+    // Detour cost: off baseline to entry + drive curvy road + back from exit
+    // Minus the baseline segment this road roughly replaces
+    var progressKm=Math.abs(c.exitProg-c.entryProg)*baseDist;
+    c.estAddedTime=Math.max(0,(c.entryDist*2+c.length-progressKm)*1.4/baseSpeed);
+  }
 
   // Greedy forward sweep: accumulate detours while budget allows
   var accepted=[],estimatedDur=baseDur,vi;
-  for(vi=0;vi<viable.length;vi++){
+  for(vi=0;vi<candidates.length;vi++){
     if(accepted.length>=8) break;
-    if(estimatedDur+viable[vi].addedTime<=maxDur){
-      accepted.push(viable[vi].candidate);
-      estimatedDur+=viable[vi].addedTime;
+    if(estimatedDur+candidates[vi].estAddedTime<=maxDur){
+      accepted.push(candidates[vi]);
+      estimatedDur+=candidates[vi].estAddedTime;
     }
   }
   return accepted.sort(function(a,b){return a.entryProg-b.entryProg;});
@@ -623,7 +621,7 @@ async function planRoute(){
     // Step 5: Select waypoints (Option C)
     setStep(5,'active');
     var org=stops[0],dst=stops[stops.length-1];
-    var wps=await selectWPs(roads,base.geo,org,dst,curv,maxDur,base.dur);
+    var wps=await selectWPs(roads,base.geo,org,dst,curv,maxDur,base.dur,base.dist);
 
     // Build final route through entry/exit pairs
     var finalPts=[org];
